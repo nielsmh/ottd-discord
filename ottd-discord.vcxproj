@@ -188,8 +188,6 @@
     <ClInclude Include="discord\types.h" />
     <ClInclude Include="discord\user_manager.h" />
     <ClInclude Include="discord\voice_manager.h" />
-    <ClInclude Include="framework.h" />
-    <ClInclude Include="pch.h" />
     <ClInclude Include="social_plugin_api.h" />
   </ItemGroup>
   <ItemGroup>

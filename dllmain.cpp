@@ -25,6 +25,8 @@
 #include <windows.h>
 
 #include "discord/discord.h"
+#include <string>
+#include <time.h>
 
 #include "social_plugin_api.h"
 
@@ -32,29 +34,23 @@
 const discord::ClientId DISCORD_CLIENT_ID = 603602960886530062;
 const char *MAIN_ICON_ASSET_NAME = "openttd_512";
 
+extern OpenTTD_SocialPluginCallbacks _callbacks;
 discord::Core *_discord = nullptr;
 
 discord::Activity _activity{};
-DWORD _activity_last_update = 0;
+ULONGLONG _activity_last_update = 0;
 bool _activity_needs_update = false;
 bool _activity_in_game = false;
 
+struct OpenJoinRequest {
+	ULONGLONG time_opened;
+	bool valid;
+	discord::UserId user_id;
+};
+OpenJoinRequest _open_join_requests[15]{};
 
-BOOL APIENTRY DllMain( HMODULE hModule,
-                       DWORD  ul_reason_for_call,
-                       LPVOID lpReserved
-                     )
-{
-    switch (ul_reason_for_call)
-    {
-    case DLL_PROCESS_ATTACH:
-    case DLL_THREAD_ATTACH:
-    case DLL_THREAD_DETACH:
-    case DLL_PROCESS_DETACH:
-        break;
-    }
-    return TRUE;
-}
+void Callback_IgnoreResult(discord::Result) { }
+
 
 void Plugin_shutdown()
 {
@@ -66,13 +62,22 @@ void Plugin_event_loop()
 {
 	if (!_discord) return;
 
-	if (_activity_needs_update && GetTickCount() - _activity_last_update > 10000) {
-		if (_activity_in_game) {
-			_discord->ActivityManager().UpdateActivity(_activity, [](discord::Result result) {});
-		} else {
-			_discord->ActivityManager().ClearActivity([](discord::Result result) {});
+	for (auto &ojr : _open_join_requests) {
+		if (!ojr.valid) continue;
+		auto age = GetTickCount64() - ojr.time_opened;
+		if (age > 10 * 60 * 1000) {
+			ojr.valid = false;
+			_callbacks.cancel_join_request(&ojr);
 		}
-		_activity_last_update = GetTickCount();
+	}
+
+	if (_activity_needs_update && GetTickCount64() - _activity_last_update > 10000) {
+		if (_activity_in_game) {
+			_discord->ActivityManager().UpdateActivity(_activity, Callback_IgnoreResult);
+		} else {
+			_discord->ActivityManager().ClearActivity(Callback_IgnoreResult);
+		}
+		_activity_last_update = GetTickCount64();
 		_activity_needs_update = false;
 	}
 
@@ -84,9 +89,10 @@ void Plugin_enter_singleplayer()
 	if (!_discord) return;
 
 	_activity.GetAssets().SetLargeImage(MAIN_ICON_ASSET_NAME);
-	_activity.SetDetails("Singleplayer");
+	_activity.SetDetails("");
 	_activity.SetType(discord::ActivityType::Playing);
 	_activity.GetSecrets().SetJoin("");
+	_activity.GetTimestamps().SetStart(time(nullptr));
 	_activity_needs_update = true;
 	_activity_in_game = true;
 }
@@ -99,6 +105,7 @@ void Plugin_enter_multiplayer(const char *server_name, const char *server_cookie
 	_activity.SetDetails(server_name);
 	_activity.SetType(discord::ActivityType::Playing);
 	_activity.GetSecrets().SetJoin(server_cookie);
+	_activity.GetTimestamps().SetStart(time(nullptr));
 	_activity_needs_update = true;
 	_activity_in_game = true;
 }
@@ -127,6 +134,7 @@ void Plugin_exit_gameplay()
 {
 	if (!_discord) return;
 
+	_activity.GetTimestamps().SetStart(0);
 	_activity_needs_update = true;
 	_activity_in_game = false;
 }
@@ -135,7 +143,20 @@ void Plugin_respond_join_request(void *join_request_cookie, OpenTTD_SocialPlugin
 {
 	if (!_discord) return;
 
-	// TODO
+	for (auto &ojr : _open_join_requests) {
+		if (&ojr == join_request_cookie && ojr.valid) {
+			discord::ActivityJoinRequestReply discord_response = discord::ActivityJoinRequestReply::Ignore;
+			switch (response) {
+				case OTTD_JRR_IGNORE: discord_response = discord::ActivityJoinRequestReply::Ignore; break;
+				case OTTD_JRR_ACCEPT: discord_response = discord::ActivityJoinRequestReply::Yes; break;
+				case OTTD_JRR_REJECT: discord_response = discord::ActivityJoinRequestReply::No; break;
+			}
+
+			_discord->ActivityManager().SendRequestReply(ojr.user_id, discord_response, Callback_IgnoreResult);
+			ojr.valid = false;
+			break;
+		}
+	}
 }
 
 
@@ -151,6 +172,29 @@ OpenTTD_SocialPluginApi _api{
 };
 OpenTTD_SocialPluginCallbacks _callbacks{};
 
+
+void Callback_OnActivityJoinRequest(const discord::User &user)
+{
+	/* Find an unused join request slot */
+	void *cookie = nullptr;
+	for (auto &ojr : _open_join_requests) {
+		if (!ojr.valid) {
+			cookie = &ojr;
+			ojr.time_opened = GetTickCount64();
+			ojr.user_id = user.GetId();
+			break;
+		}
+	}
+	if (!cookie) {
+		/* No slot found: Inform Discord we are ignoring this request */
+		_discord->ActivityManager().SendRequestReply(user.GetId(), discord::ActivityJoinRequestReply::Ignore, Callback_IgnoreResult);
+		return;
+	}
+
+	_callbacks.handle_join_request(cookie, user.GetUsername());
+}
+
+
 int SocialInit(int api_version, struct OpenTTD_SocialPluginApi *api, const struct OpenTTD_SocialPluginCallbacks *callbacks)
 {
 	if (api_version != OTTD_SOCIAL_PLUGIN_API_VERSION) return 0;
@@ -161,9 +205,28 @@ int SocialInit(int api_version, struct OpenTTD_SocialPluginApi *api, const struc
 
 	auto res = discord::Core::Create(DISCORD_CLIENT_ID, DiscordCreateFlags_NoRequireDiscord, &_discord);
 	if (res == discord::Result::Ok) {
+		_activity.GetAssets().SetLargeImage(MAIN_ICON_ASSET_NAME);
+		_activity.SetType(discord::ActivityType::Playing);
+		_discord->ActivityManager().UpdateActivity(_activity, Callback_IgnoreResult);
+		_activity_last_update = GetTickCount64();
+		_activity_needs_update = false;
+		_activity_in_game = false;
+		_discord->ActivityManager().ClearActivity(Callback_IgnoreResult);
+
+		_discord->ActivityManager().OnActivityJoinRequest.Connect(Callback_OnActivityJoinRequest);
+		_discord->ActivityManager().OnActivityJoin.Connect(_callbacks.join_requested_game);
+
+		_discord->ActivityManager().RegisterCommand(callbacks->launch_command);
+		_callbacks.launch_command = nullptr; // not our pointer to own
+
 		return 1;
 	} else {
 		// TODO: maybe some logging
 		return 0;
 	}
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
+{
+	return TRUE;
 }
