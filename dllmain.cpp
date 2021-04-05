@@ -169,6 +169,8 @@ OpenTTD_SocialPluginApi _api{
 	Plugin_enter_spectate,
 	Plugin_exit_gameplay,
 	Plugin_respond_join_request,
+	nullptr, // open browser, not supported by Discord
+	nullptr, // get preferred player name, requires authentication
 };
 OpenTTD_SocialPluginCallbacks _callbacks{};
 
